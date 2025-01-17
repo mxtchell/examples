@@ -1,0 +1,449 @@
+from answer_rocket import AnswerRocketClient
+from sp_tools.analytics_utils import Connector, get_filter_clause
+
+# Initialize the AnswerRocket client and skill platform
+max_client = AnswerRocketClient()
+sp = load_skill_platform()
+dataset_metadata = sp.data.get_metadata()
+
+# Extract the database ID and set up the environment connection
+database_id = dataset_metadata.get("database_id")
+env.table_name = dataset_metadata.get("sql_table")
+
+env.con = Connector(connector_type="db", database_id=database_id, max_sdk=max_client, limit=10000)
+
+# Set the metric and start date
+metric = env.metric
+start_date = env.start_date
+brand_filter = env.brand_filter.upper()  # Convert brand filter to uppercase
+
+if metric == 'sales':
+    alias_name = 'sales'
+elif metric == 'volume':
+    alias_name = 'volume'
+elif metric == 'units':
+    alias_name = 'units'
+else:
+    alias_name = 'value'  # Default alias if needed
+
+# Construct the SQL query conditionally including the brand column
+if brand_filter != 'ALL':
+    sql = f"""
+    SELECT month, brand, SUM({metric}) AS {metric}
+    FROM pasta_max
+    WHERE month >= '{start_date}' AND UPPER(brand) = '{brand_filter}'
+    GROUP BY month, brand
+    """
+else:
+    sql = f"""
+    SELECT month, SUM({metric}) AS {metric}
+    FROM pasta_max
+    WHERE month >= '{start_date}'
+    GROUP BY month
+    """
+
+# Execute the query and store the result in a DataFrame
+df = env.con.execute(sql)
+
+# Check if the DataFrame is empty
+if df.empty:
+    raise ValueError("No data available for the selected metric and date range.")
+
+# Pass the DataFrame to the next node
+startHere = df
+
+#Node 2 Below
+import pandas as pd
+import numpy as np
+from scipy import stats
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from prophet import Prophet
+import statsmodels.api as sm
+
+# Load the skill platform
+sp = load_skill_platform()
+sp.data.platform_settings("limits.fact_rows", 100)
+
+# Helper function for Mean Absolute Percentage Error (MAPE)
+def mape(actual, predicted):
+    actual, predicted = np.array(actual), np.array(predicted)
+    min_len = min(len(actual), len(predicted))
+    actual = actual[:min_len]
+    predicted = predicted[:min_len]
+    actual = np.where(actual == 0, np.nan, actual)  
+    return np.nanmean(np.abs((actual - predicted) / actual)) * 100
+
+# Helper function to calculate a combined score based on R-squared and MAPE
+def combined_score(r2, mape_score, weight_r2=0.5, weight_mape=0.5):
+    if np.isnan(mape_score):
+        return r2  
+    return weight_r2 * r2 - weight_mape * mape_score  
+
+# Retrieve metric, start date, brand filter, and forecast period from the environment
+metric = env.metric
+start_date = pd.to_datetime(env.start_date)  
+brand_filter = env.brand_filter.upper()  
+forecast_period = int(env.forecast_period)  
+
+# Assuming df is your DataFrame from the previous node
+df = startHere.copy()
+df['month'] = pd.to_datetime(df['month'])
+df = df[df['month'] >= start_date].sort_values(by='month')
+
+# Generate forecast date range
+forecast_months = pd.date_range(start=df['month'].max() + pd.DateOffset(months=1), periods=forecast_period, freq='MS')
+forecast_df = pd.DataFrame({'month': forecast_months})
+df['time_index'] = np.arange(len(df))
+
+# Define forecasting functions
+def linear_forecast(df, forecast_df):
+    X = sm.add_constant(df['time_index'])
+    model = sm.OLS(df[env.metric], X).fit()
+    slope, intercept = model.params['time_index'], model.params['const']
+    forecast_df[f'forecast_{env.metric}'] = intercept + slope * np.arange(len(df), len(df) + len(forecast_df))
+    return forecast_df, slope, intercept, model.rsquared
+
+def holt_winters_forecast(df, forecast_df):
+    # Sort the data by month to ensure correctness
+    df = df.sort_values(by='month')
+    
+    # Fit Holt-Winters model with a 6-month seasonality
+    model = ExponentialSmoothing(df[env.metric], seasonal='add', trend='add', seasonal_periods=6, damped_trend=True).fit()
+    
+    # Generate forecast sales
+    forecast_sales = model.forecast(steps=len(forecast_df))
+
+    # Assign forecasted sales to the forecast DataFrame
+    forecast_df[f'forecast_{env.metric}'] = forecast_sales.values
+    return forecast_df, model.sse
+
+def prophet_forecast(df, forecast_df):
+    # Prepare data for Prophet
+    df_prophet = df.rename(columns={'month': 'ds', env.metric: 'y'})[['ds', 'y']]
+    
+    # Initialize Prophet with changepoint_prior_scale to make it less sensitive to trend changes
+    model = Prophet(changepoint_prior_scale=0.01)
+    
+    # Fit the model
+    model.fit(df_prophet)
+    
+    # Generate future dataframe
+    future = model.make_future_dataframe(periods=len(forecast_df), freq='MS')
+    
+    # Predict the future
+    forecast = model.predict(future)
+    
+    # Assign forecasted sales to the forecast DataFrame
+    forecast_df[f'forecast_{env.metric}'] = forecast['yhat'].iloc[-len(forecast_df):].values
+    return forecast_df, model.history['y'].corr(forecast['yhat'])**2
+
+# Evaluate models
+models = {}
+mape_scores = {}
+
+# Linear forecast
+forecast_df, slope, intercept, r2_linear = linear_forecast(df, forecast_df)
+models['Linear'] = r2_linear
+mape_scores['Linear'] = mape(df[env.metric].dropna(), forecast_df[f'forecast_{env.metric}'])
+
+# Holt-Winters forecast
+forecast_df_hw, sse_hw = holt_winters_forecast(df, forecast_df)
+models['Holt-Winters'] = 1 - sse_hw / np.var(df[env.metric])
+mape_scores['Holt-Winters'] = mape(df[env.metric].dropna(), forecast_df_hw[f'forecast_{env.metric}'])
+
+# Prophet forecast
+forecast_df_prophet, r2_prophet = prophet_forecast(df, forecast_df)
+models['Prophet'] = r2_prophet
+mape_scores['Prophet'] = mape(df[env.metric].dropna(), forecast_df_prophet[f'forecast_{env.metric}'])
+
+# Calculate combined scores
+combined_scores = {
+    model: combined_score(models[model], mape_scores[model])
+    for model in models
+}
+
+best_model = max(combined_scores, key=combined_scores.get)
+env.best_model = best_model
+
+# Apply the best model
+if best_model == 'Holt-Winters':
+    forecast_df, sse_hw = holt_winters_forecast(df, forecast_df)
+elif best_model == 'Linear':
+    forecast_df, slope, intercept, _ = linear_forecast(df, forecast_df)
+elif best_model == 'Prophet':
+    forecast_df = prophet_forecast(df, forecast_df)[0]
+
+# Combine historical data with forecast data
+combined_df = pd.concat([df.set_index('month'), forecast_df.set_index('month')], axis=1).reset_index()
+combined_df['best_model'] = best_model  
+
+# Calculate rolling metrics
+combined_df['rolling_max'] = combined_df[env.metric].rolling(window=3).max()  # Change the window size as necessary
+combined_df['rolling_min'] = combined_df[env.metric].rolling(window=3).min()  # Change the window size as necessary
+
+# Calculate Z-scores for outlier detection
+combined_df['z_score'] = stats.zscore(combined_df[env.metric].dropna())
+combined_df['outlier_flag'] = np.where((combined_df['z_score'] > 1.7) | (combined_df['z_score'] < -1.7), 'Outlier', 'Normal')
+combined_df['outlier_value'] = np.where(combined_df['outlier_flag'] == 'Outlier', combined_df[env.metric], None)
+
+# Year-over-year comparison
+combined_df['last_year_sales'] = combined_df[env.metric].shift(12)
+combined_df['year_over_year_growth'] = (combined_df[env.metric] - combined_df['last_year_sales']) / combined_df['last_year_sales'] * 100
+
+# Format for Highcharts
+combined_df['month'] = combined_df['month'].dt.strftime('%m/%Y')
+
+# Display the combined DataFrame with forecast and outlier flag
+df = combined_df
+
+# Pass best model for chart rendering
+sp.ux.add_dynamic_viz_panel('forecast_chart', df, {
+    'best_model': best_model,
+    'metric': metric.capitalize(),
+    'forecast_type': best_model,
+    'start_date': env.start_date,
+    'forecast_period': f"{forecast_months.min().strftime('%m/%Y')} - {forecast_months.max().strftime('%m/%Y')}"
+})
+
+# Add UI parameter bubbles
+sp.ux.add_ui_parameter_bubble("Forecast Type", f"Forecast: {best_model.capitalize()}")
+sp.ux.add_ui_parameter_bubble("Period", f"Period: {forecast_months.min().strftime('%m/%Y')} - {forecast_months.max().strftime('%m/%Y')}")
+sp.ux.add_ui_parameter_bubble("Metric", f"Metric: {metric.capitalize()}")
+sp.ux.add_ui_parameter_bubble("Start Date", f"Start Date: {start_date.strftime('%m/%Y')}")
+sp.ux.add_ui_parameter_bubble("Brand Filter", f"Brand: {brand_filter}")
+
+# Output combined DataFrame for further visualization or export
+df = df.fillna('none')
+
+#Node 3
+import pandas as pd
+import numpy as np
+
+# Import the DataFrame from Forecast
+df = Forecast.copy()
+
+# Ensure the metric and 'month' columns are numeric and date respectively
+df[env.metric] = pd.to_numeric(df[env.metric], errors='coerce')
+df['month'] = pd.to_datetime(df['month'], errors='coerce')
+
+# Use the user-specified start date dynamically (from env.start_date)
+start_date = pd.to_datetime(env.start_date)
+end_date = pd.to_datetime('2023-12-01')  # Keeping the end date fixed for now
+
+# Filter the DataFrame based on the user-defined start date and the fixed end date
+df = df[(df['month'] >= start_date) & (df['month'] <= end_date)]
+
+# Calculate month-over-month growth for the chosen metric
+df[f'{env.metric}_growth'] = df[env.metric].pct_change()
+
+# Check if there are negative growth periods
+negative_growth_periods = df[df[f'{env.metric}_growth'] < 0]
+
+# Identify consecutive growth streaks (both positive and negative)
+df['growth_streak'] = np.where(df[f'{env.metric}_growth'] > 0, 1, np.where(df[f'{env.metric}_growth'] < 0, -1, 0))
+df['streak_id'] = (df['growth_streak'] != df['growth_streak'].shift()).cumsum()
+
+# Group by streak and calculate streak length and total growth
+streaks = df.groupby('streak_id').agg(
+    streak_type=('growth_streak', 'first'),
+    streak_length=('growth_streak', 'size'),
+    start_month=('month', 'first'),
+    end_month=('month', 'last'),
+    total_growth=(f'{env.metric}_growth', lambda x: (1 + x).prod() - 1)
+).reset_index(drop=True)
+
+# Instead of filtering streaks with length > 3, find the longest positive and negative streaks
+longest_positive_streak = streaks[streaks['streak_type'] > 0].nlargest(1, 'streak_length')
+longest_negative_streak = streaks[streaks['streak_type'] < 0].nlargest(1, 'streak_length')
+
+# Combine the longest positive and negative streaks
+top_streaks = pd.concat([longest_positive_streak, longest_negative_streak]).drop_duplicates()
+
+# Add the streak information to the final DataFrame
+growth_streaks_df = top_streaks[['start_month', 'end_month', 'streak_length', 'total_growth']]
+
+# Store or send the final DataFrame with the facts related to the chosen model
+df = growth_streaks_df
+
+# If printing the DataFrame is necessary for debugging or logging purposes
+print(df)
+
+# Node 4 (viz)
+{
+    chart: {
+        type: 'line',
+        backgroundColor: '#f9f9f9', // Add a subtle background color for better contrast
+        borderColor: '#e0e0e0', // Light border around the chart
+        borderWidth: 1,
+        plotBorderColor: '#e0e0e0', // Light border around the plot area
+        plotBorderWidth: 1
+    },
+    title: {
+        text: '{{ best_model.capitalize() }} {{ metric.capitalize() }} Forecast',
+        align: 'left',
+        x: 10, // Adjust the horizontal positioning
+        y: 10,
+        style: {
+            fontSize: '20px', // Increase font size for the title
+            fontWeight: 'bold',
+            color: '#333' // Darker color for better readability
+        }
+    },
+    subtitle: {
+        text: 'Monthly {{ metric.capitalize() }} Data',
+        style: {
+            fontSize: '12px', // Increase subtitle font size for visibility
+            color: '#666' // Lighter color for subtitle
+        },
+        align: 'left',
+        x: 10,
+        y: 35
+    },
+    xAxis: {
+        categories: {{ df["month"].to_list() }},
+        title: {
+            text: "Month",
+            style: {
+                fontWeight: 'bold'
+            }
+        },
+        labels: {
+            rotation: -45 // Rotate labels for better visibility if crowded
+        }
+    },
+    yAxis: {
+        title: {
+            text: "{{ metric.capitalize() }}",
+            style: {
+                fontWeight: 'bold'
+            }
+        },
+        labels: {
+            formatter: function() {
+                return this.value.toLocaleString(); // Format y-axis values with commas
+            }
+        }
+    },
+    tooltip: {
+        shared: true, // Make tooltips shared for better comparison
+        useHTML: true, // Enable HTML in tooltips for custom styling
+        style: {
+            fontSize: '12px'
+        },
+        headerFormat: '<b>{point.key}</b><br/>', // Header formatting for the tooltip
+        pointFormat: '<span style="color:{point.color}">{series.name}: <b>{point.y:,.0f}</b></span><br/>' // Styled point format
+    },
+    plotOptions: {
+        series: {
+            marker: {
+                enabled: false // Disable markers for cleaner lines
+            },
+            states: {
+                hover: {
+                    enabled: true, // Enable hover effect on series
+                    lineWidthPlus: 2
+                }
+            }
+        }
+    },
+    series: [
+        {
+            name: "Actual {{ metric.capitalize() }}",
+            data: {{ df[metric].to_list() }},
+            tooltip: {
+                pointFormat: '<b>{{ metric.capitalize() }}</b>: <span style="color:#0000FF">{point.y:,.0f}</span>' // Styled tooltip for actual data
+            }
+        },
+        {
+            name: "Forecasted {{ metric.capitalize() }}",
+            data: {{ df["forecast_" + metric].to_list() }},
+            color: '#00FF00',  // Bright green for the forecast line
+            dashStyle: 'Solid',
+            tooltip: {
+                pointFormat: '<b>Forecasted {{ metric.capitalize() }}</b>: <span style="color:#00FF00">{point.y:,.0f}</span>' // Styled tooltip for forecast data
+            }
+        },
+        {
+            name: "Rolling Max",
+            data: {{ df["rolling_max"].to_list() }},
+            dashStyle: 'ShortDash',
+            color: '#ADD8E6',
+             tooltip: {
+                pointFormat: '' // No values shown in the tooltip
+            }
+        },
+        {
+            name: "Rolling Min",
+            data: {{ df["rolling_min"].to_list() }},
+            dashStyle: 'ShortDot',
+            color: '#ADD8E6',
+             tooltip: {
+                pointFormat: '' // No values shown in the tooltip
+            }
+        },
+        {
+            name: "Range",
+            type: 'arearange',
+            data: {{ df[["rolling_min", "rolling_max"]].to_records(index=False).tolist() }},
+            color: '#ADD8E6',
+            fillOpacity: 0.2,
+            lineWidth: 0,
+            linkedTo: ':previous',
+            tooltip: {
+                pointFormat: null
+            }
+        },
+        {
+            name: "Outliers",
+            type: 'scatter',
+            data: {{ df["outlier_value"].to_list() }},
+            marker: {
+                enabled: true,
+                symbol: 'circle',
+                radius: 6, // Slightly larger radius for visibility
+                fillColor: 'rgba(255, 0, 0, 0.5)'
+            },
+            tooltip: {
+                pointFormat: '<b>Outlier</b>: <span style="color:#FF0000">{point.y:,.0f}</span>' // Styled tooltip for outliers
+            }
+        }
+    ],
+    credits: {
+        enabled: false
+    },
+    legend: {
+        align: 'right', // Align legend to the right
+        verticalAlign: 'top',
+        layout: 'vertical', // Stack legend items vertically
+        floating: true,
+        backgroundColor: 'rgba(255, 255, 255, 0.8)', // Semi-transparent background for legend
+        borderWidth: 1,
+        borderColor: '#e0e0e0'
+    }
+}
+#Prompt Node
+{{base_prompt}} Write a short headline followed by a 100 word or less paragraph about using facts below.  Format response using markdown. Talk about any positive or negative growth streaks. talk about the forecast model we chose, and why. Talk about z scores, outliers, etc. 
+
+Use the following example as an idea of how to right good insights:
+Example:
+Facts:
+[{'title': 'Forecast fact', 'facts': [{'month': '10/2021', 'sales': 169186747.79100013, 'time_index': 0.0, 'forecast_sales': 'none', 'z_score': -0.8523011095416497, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 169186747.79100013, 'rolling_min': 169186747.79100013}, {'month': '11/2021', 'sales': 171541947.95300025, 'time_index': 1.0, 'forecast_sales': 'none', 'z_score': -0.7143979280873161, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 171541947.95300025, 'rolling_min': 169186747.79100013}, {'month': '12/2021', 'sales': 180130374.9780002, 'time_index': 2.0, 'forecast_sales': 'none', 'z_score': -0.21152287332761358, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 180130374.9780002, 'rolling_min': 169186747.79100013}, {'month': '01/2022', 'sales': 180084029.73300016, 'time_index': 3.0, 'forecast_sales': 'none', 'z_score': -0.2142365096604838, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 180130374.9780002, 'rolling_min': 171541947.95300025}, {'month': '02/2022', 'sales': 173465771.6730002, 'time_index': 4.0, 'forecast_sales': 'none', 'z_score': -0.6017529750910495, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 180130374.9780002, 'rolling_min': 173465771.6730002}, {'month': '03/2022', 'sales': 183746123.79800013, 'time_index': 5.0, 'forecast_sales': 'none', 'z_score': 0.00018875681863050482, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 183746123.79800013, 'rolling_min': 173465771.6730002}, {'month': '04/2022', 'sales': 196946692.88900015, 'time_index': 6.0, 'forecast_sales': 'none', 'z_score': 0.7731168943195617, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 196946692.88900015, 'rolling_min': 173465771.6730002}, {'month': '05/2022', 'sales': 214504473.0, 'time_index': 7.0, 'forecast_sales': 'none', 'z_score': 1.801171229423832, 'outlier_flag': 'Outlier', 'outlier_value': 214504473.0, 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 214504473.0, 'rolling_min': 183746123.79800013}, {'month': '06/2022', 'sales': 196946692.88900015, 'time_index': 8.0, 'forecast_sales': 'none', 'z_score': 0.7731168943195617, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 214504473.0, 'rolling_min': 196946692.88900015}, {'month': '07/2022', 'sales': 192629880.83800024, 'time_index': 9.0, 'forecast_sales': 'none', 'z_score': 0.520356162905658, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 214504473.0, 'rolling_min': 192629880.83800024}, {'month': '08/2022', 'sales': 196320420.0540002, 'time_index': 10.0, 'forecast_sales': 'none', 'z_score': 0.7364469680014633, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 196946692.88900015, 'rolling_min': 192629880.83800024}, {'month': '09/2022', 'sales': 195805957.41500002, 'time_index': 11.0, 'forecast_sales': 'none', 'z_score': 0.706323823564658, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 'none', 'year_over_year_growth': 'none', 'rolling_max': 196320420.0540002, 'rolling_min': 192629880.83800024}, {'month': '10/2022', 'sales': 196468425.2120002, 'time_index': 12.0, 'forecast_sales': 'none', 'z_score': 0.745113060374061, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 169186747.79100013, 'year_over_year_growth': 16.12518579451724, 'rolling_max': 196468425.2120002, 'rolling_min': 195805957.41500002}, {'month': '11/2022', 'sales': 202736536.77800012, 'time_index': 13.0, 'forecast_sales': 'none', 'z_score': 1.1121275250503975, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 171541947.95300025, 'year_over_year_growth': 18.184816715236725, 'rolling_max': 202736536.77800012, 'rolling_min': 195805957.41500002}, {'month': '12/2022', 'sales': 215211825.33599997, 'time_index': 14.0, 'forecast_sales': 'none', 'z_score': 1.8425885743770993, 'outlier_flag': 'Outlier', 'outlier_value': 215211825.33599997, 'last_year_sales': 180130374.9780002, 'year_over_year_growth': 19.475588368860254, 'rolling_max': 215211825.33599997, 'rolling_min': 196468425.2120002}, {'month': '01/2023', 'sales': 208375380.50500008, 'time_index': 15.0, 'forecast_sales': 'none', 'z_score': 1.4422966980249483, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 180084029.73300016, 'year_over_year_growth': 15.710083128385023, 'rolling_max': 215211825.33599997, 'rolling_min': 202736536.77800012}, {'month': '02/2023', 'sales': 204958006.68800017, 'time_index': 16.0, 'forecast_sales': 'none', 'z_score': 1.2422004475292745, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 173465771.6730002, 'year_over_year_growth': 18.15472569099448, 'rolling_max': 215211825.33599997, 'rolling_min': 204958006.68800017}, {'month': '03/2023', 'sales': 173511876.31100014, 'time_index': 17.0, 'forecast_sales': 'none', 'z_score': -0.5990534269326483, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 183746123.79800013, 'year_over_year_growth': -5.569775990622218, 'rolling_max': 208375380.50500008, 'rolling_min': 173511876.31100014}, {'month': '04/2023', 'sales': 183746123.79800028, 'time_index': 18.0, 'forecast_sales': 'none', 'z_score': 0.00018875681863922986, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 196946692.88900015, 'year_over_year_growth': -6.702610182157137, 'rolling_max': 204958006.68800017, 'rolling_min': 173511876.31100014}, {'month': '05/2023', 'sales': 158619194.12300017, 'time_index': 19.0, 'forecast_sales': 'none', 'z_score': -1.4710592493037564, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 214504473.0, 'year_over_year_growth': -26.05319977499948, 'rolling_max': 183746123.79800028, 'rolling_min': 158619194.12300017}, {'month': '06/2023', 'sales': 159044325.52000013, 'time_index': 20.0, 'forecast_sales': 'none', 'z_score': -1.4461666847021002, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 196946692.88900015, 'year_over_year_growth': -19.244987977717365, 'rolling_max': 183746123.79800028, 'rolling_min': 158619194.12300017}, {'month': '07/2023', 'sales': 158113323.64500013, 'time_index': 21.0, 'forecast_sales': 'none', 'z_score': -1.5006793000517094, 'outlier_flag': 'Outlier', 'outlier_value': 158113323.64500013, 'last_year_sales': 192629880.83800024, 'year_over_year_growth': -17.9185892878313, 'rolling_max': 159044325.52000013, 'rolling_min': 158113323.64500013}, {'month': '08/2023', 'sales': 160292952.7320002, 'time_index': 22.0, 'forecast_sales': 'none', 'z_score': -1.3730562681169405, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 196320420.0540002, 'year_over_year_growth': -18.351360144854127, 'rolling_max': 160292952.7320002, 'rolling_min': 158113323.64500013}, {'month': '09/2023', 'sales': 167260926.61300018, 'time_index': 23.0, 'forecast_sales': 'none', 'z_score': -0.9650630189722211, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 195805957.41500002, 'year_over_year_growth': -14.578223859399847, 'rolling_max': 167260926.61300018, 'rolling_min': 158113323.64500013}, {'month': '10/2023', 'sales': 173101725.35500026, 'time_index': 24.0, 'forecast_sales': 'none', 'z_score': -0.6230688472020178, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 196468425.2120002, 'year_over_year_growth': -11.893361404910731, 'rolling_max': 173101725.35500026, 'rolling_min': 160292952.7320002}, {'month': '11/2023', 'sales': 171541947.95300022, 'time_index': 25.0, 'forecast_sales': 'none', 'z_score': -0.7143979280873178, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 202736536.77800012, 'year_over_year_growth': -15.386762209102198, 'rolling_max': 173101725.35500026, 'rolling_min': 167260926.61300018}, {'month': '12/2023', 'sales': 176766618.75200018, 'time_index': 26.0, 'forecast_sales': 'none', 'z_score': -0.40847967245091477, 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 215211825.33599997, 'year_over_year_growth': -17.86389131915828, 'rolling_max': 176766618.75200018, 'rolling_min': 171541947.95300022}, {'month': '01/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 166644940.61632678, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 208375380.50500008, 'year_over_year_growth': 'none', 'rolling_max': 176766618.75200018, 'rolling_min': 171541947.95300022}, {'month': '02/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 184609036.5004431, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 204958006.68800017, 'year_over_year_growth': 'none', 'rolling_max': 176766618.75200018, 'rolling_min': 176766618.75200018}, {'month': '03/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 164061295.68904305, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 173511876.31100014, 'year_over_year_growth': 'none', 'rolling_max': 'none', 'rolling_min': 'none'}, {'month': '04/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 134536612.09171537, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 183746123.79800028, 'year_over_year_growth': 'none', 'rolling_max': 'none', 'rolling_min': 'none'}, {'month': '05/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 201409353.4614819, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 158619194.12300017, 'year_over_year_growth': 'none', 'rolling_max': 'none', 'rolling_min': 'none'}, {'month': '06/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 123726298.42121807, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 159044325.52000013, 'year_over_year_growth': 'none', 'rolling_max': 'none', 'rolling_min': 'none'}, {'month': '07/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 98180422.3637038, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 158113323.64500013, 'year_over_year_growth': 'none', 'rolling_max': 'none', 'rolling_min': 'none'}, {'month': '08/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 123269525.90949713, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 160292952.7320002, 'year_over_year_growth': 'none', 'rolling_max': 'none', 'rolling_min': 'none'}, {'month': '09/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 129911462.62793262, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 167260926.61300018, 'year_over_year_growth': 'none', 'rolling_max': 'none', 'rolling_min': 'none'}, {'month': '10/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 148941473.46113965, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 173101725.35500026, 'year_over_year_growth': 'none', 'rolling_max': 'none', 'rolling_min': 'none'}, {'month': '11/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 147080036.49681595, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 171541947.95300022, 'year_over_year_growth': 'none', 'rolling_max': 'none', 'rolling_min': 'none'}, {'month': '12/2024', 'sales': 'none', 'time_index': 'none', 'forecast_sales': 149214887.98568296, 'z_score': 'none', 'outlier_flag': 'Normal', 'outlier_value': 'none', 'last_year_sales': 176766618.75200018, 'year_over_year_growth': 'none', 'rolling_max': 'none', 'rolling_min': 'none'}]}, {'title': 'df_growth_streaks fact', 'facts': [{'start_month': Timestamp('2022-03-01 00:00:00'), 'end_month': Timestamp('2022-05-01 00:00:00'), 'streak_length': 3, 'total_growth': 0.2365809746280194}, {'start_month': Timestamp('2023-01-01 00:00:00'), 'end_month': Timestamp('2023-03-01 00:00:00'), 'streak_length': 3, 'total_growth': -0.1937623500004969}]}].
+
+
+Example Summary:
+# Sales Performance: Stable Trends with Predictive Insights
+
+**Trend**: Sales fluctuated consistently, peaking at 214.5M in May 2022, followed by a 26.05% decline in mid-2023 during a challenging period.
+
+**Forecast**: January 2024 forecasts sales at 174.31M using the Linear model, favored for its straightforward interpretation (R-squared: 0.09).
+
+**Outliers**: Outliers were identified in May 2022 and December 2022, with z-scores of 1.80 and 1.84.
+
+**Year-Over-Year**: December 2022 sales increased 19.48% from the previous year, while 2023 sales declined by 17%.
+
+**Summary**: Sales reached a high of 214.5M in May 2022, indicating potential challenges ahead.
+
+
+
+
+Results: {{facts}} 
