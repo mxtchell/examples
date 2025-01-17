@@ -33,8 +33,8 @@ documents = parser.load_data(open(pdf_path, "rb"), extra_info={"file_name": os.p
 # Initialize a dictionary to hold the PDF's metadata and chunks
 pdf_dict = {
     "File": os.path.basename(pdf_path),
-    "Description": "Mike to fill in",
-    "Summary": "Mike to fill in",
+    "Description": "to fill in",
+    "Summary": "to fill in",
     "Chunks": []
 }
 page = 0
